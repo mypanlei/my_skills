@@ -1,0 +1,559 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MEM_DIR=""
+REPO_ROOT=""
+
+find_repo_root() {
+    if [ -n "$REPO_ROOT" ]; then
+        printf '%s\n' "$REPO_ROOT"
+        return
+    fi
+
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    printf '%s\n' "$REPO_ROOT"
+}
+
+get_branch() {
+    local dir="$1"
+    local branch
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+    if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+        branch="main"
+    fi
+    echo "$branch"
+}
+
+resolve_mem_dir() {
+    if [ -n "$MEM_DIR" ]; then
+        return
+    fi
+
+    local root
+    root=$(find_repo_root)
+    MEM_DIR="$root/.mem"
+}
+
+plain_mode_enabled() {
+    resolve_mem_dir
+
+    local mode_file mode
+    mode_file="$MEM_DIR/.gitmemo-mode"
+
+    if [ ! -f "$mode_file" ]; then
+        return 1
+    fi
+
+    mode=$(tr -d '[:space:]' < "$mode_file" 2>/dev/null || true)
+    [ "$mode" = 'plain' ]
+}
+
+normalize_path_like() {
+    local path="$1"
+    path="${path//\\//}"
+    case "$path" in
+        ./*) path="${path#./}" ;;
+    esac
+    printf '%s\n' "$path"
+}
+
+ensure_init() {
+    resolve_mem_dir
+
+    if plain_mode_enabled; then
+        mkdir -p "$MEM_DIR/entries"
+        return 0
+    fi
+
+    if [ ! -d "$MEM_DIR/.git" ]; then
+        mkdir -p "$MEM_DIR/entries"
+        git -C "$MEM_DIR" init -q
+        touch "$MEM_DIR/entries/.gitkeep"
+        git -C "$MEM_DIR" add 'entries/.gitkeep'
+        git -C "$MEM_DIR" commit -q -m 'init: initialize memory repo'
+    fi
+}
+
+require_git_backed_repo() {
+    if plain_mode_enabled; then
+        echo 'Error: .mem is configured in plain mode for main-repo tracking; git-backed gitmemo commands are disabled to avoid recreating a nested repo.' >&2
+        return 1
+    fi
+}
+
+sync_branch() {
+    local root
+    root=$(find_repo_root)
+    local repo_branch
+    repo_branch=$(get_branch "$root")
+    local mem_branch
+    mem_branch=$(get_branch "$MEM_DIR")
+
+    if [ "$mem_branch" != "$repo_branch" ]; then
+        if git -C "$MEM_DIR" show-ref --verify --quiet "refs/heads/$repo_branch" 2>/dev/null; then
+            git -C "$MEM_DIR" checkout -q "$repo_branch"
+        else
+            git -C "$MEM_DIR" checkout -q -b "$repo_branch"
+        fi
+    fi
+    echo "$repo_branch"
+}
+
+normalize_entry_file() {
+    local file="$1"
+    if [ -z "$file" ]; then
+        echo ""
+        return
+    fi
+
+    local direct_entry
+    direct_entry=$(entry_file_from_path "$file")
+    if [ -n "$direct_entry" ]; then
+        echo "$direct_entry"
+        return
+    fi
+
+    local normalized
+    normalized=$(normalize_path_like "$file")
+
+    case "$normalized" in
+        entries/*|/*|[A-Za-z]:/*) echo "$normalized" ;;
+        *) echo "entries/$normalized" ;;
+    esac
+}
+
+entry_file_from_path() {
+    local file="$1"
+    [ -z "$file" ] && return 0
+
+    local normalized
+    normalized=$(normalize_path_like "$file")
+
+    case "$normalized" in
+        .mem/entries/*)
+            printf '%s\n' "${normalized#.mem/}"
+            return 0
+            ;;
+        entries/*)
+            printf '%s\n' "$normalized"
+            return 0
+            ;;
+    esac
+
+    if [ -e "$file" ]; then
+        local dir base full mem_root
+        dir=$(cd "$(dirname "$file")" 2>/dev/null && pwd -P) || dir=""
+        if [ -n "$dir" ]; then
+            base=$(basename "$file")
+            full="$dir/$base"
+            mem_root=$(cd "$MEM_DIR" 2>/dev/null && pwd -P) || mem_root=""
+            if [ -n "$mem_root" ]; then
+                case "$full" in
+                    "$mem_root"/entries/*)
+                        printf '%s\n' "$(normalize_path_like "${full#"$mem_root"/}")"
+                        return 0
+                        ;;
+                esac
+            fi
+        fi
+    fi
+}
+
+is_safe_entry_path() {
+    local file="$1"
+    case "$file" in
+        /*|*../*|*/..|*\\*|*:*)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+slugify_title() {
+    local title="$1"
+    local slug
+    slug=$(printf '%s' "$title"         | tr '[:upper:]' '[:lower:]'         | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+    if [ -z "$slug" ]; then
+        slug='memory-entry'
+    fi
+    echo "$slug"
+}
+
+cmd_write() {
+    ensure_init
+    require_git_backed_repo || return 1
+    local file="" title="" body="" content="" content_file=""
+    local direct_content_file="" use_existing_entry=0 delete_content_file=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --file)         file="$2";         shift 2 ;;
+            --title)        title="$2";        shift 2 ;;
+            --body)         body="$2";         shift 2 ;;
+            --content)      content="$2";      shift 2 ;;
+            --content-file) content_file="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; return 1 ;;
+        esac
+    done
+
+    if [ -z "$title" ]; then
+        echo 'Usage: mem.sh write --title <title> [--file <path>] [--body <body>] [--content-file <path> | --content <markdown>]' >&2
+        return 1
+    fi
+
+    if [ -n "$content" ] && [ -n "$content_file" ]; then
+        echo 'Error: use only one of --content or --content-file' >&2
+        return 1
+    fi
+
+    if [ -n "$content" ] && [ -z "$content_file" ]; then
+        echo 'Warning: --content may hit shell escaping issues. Prefer a temp .md file with --content-file.' >&2
+    fi
+
+    if [ -n "$content_file" ] && [ ! -f "$content_file" ]; then
+        echo "Error: content file not found: $content_file" >&2
+        return 1
+    fi
+
+    if [ -n "$content_file" ]; then
+        direct_content_file=$(entry_file_from_path "$content_file")
+    fi
+
+    if [ -n "$file" ]; then
+        file=$(normalize_entry_file "$file")
+        if [ -n "$direct_content_file" ] && [ "$file" != "$direct_content_file" ]; then
+            echo 'Error: --file must match the existing .mem/entries path referenced by --content-file' >&2
+            return 1
+        fi
+    elif [ -n "$direct_content_file" ]; then
+        file="$direct_content_file"
+    elif [ -n "$content" ] || [ -n "$content_file" ]; then
+        local ts slug
+        ts=$(date -u +'%Y%m%dT%H%M%SZ')
+        slug=$(slugify_title "$title")
+        file="entries/$ts-$slug.md"
+    else
+        echo 'Error: missing content. Use --content, --content-file, or pre-write a .mem/entries file and pass --file.' >&2
+        return 1
+    fi
+
+    if ! is_safe_entry_path "$file"; then
+        echo "Error: invalid file path: $file" >&2
+        return 1
+    fi
+
+    case "$file" in
+        *.md) ;;
+        *) file="${file}.md" ;;
+    esac
+
+    sync_branch >/dev/null
+
+    local full_path
+    full_path="$MEM_DIR/$file"
+
+    if [ -n "$direct_content_file" ]; then
+        use_existing_entry=1
+    elif [ -z "$content" ] && [ -z "$content_file" ]; then
+        if [ -f "$full_path" ]; then
+            use_existing_entry=1
+        else
+            echo "Error: existing entry file not found: $full_path" >&2
+            return 1
+        fi
+    elif [ -n "$content_file" ]; then
+        delete_content_file=1
+    fi
+
+    if [ "$use_existing_entry" -eq 1 ]; then
+        if [ ! -f "$full_path" ]; then
+            echo "Error: existing entry file not found after branch sync: $full_path" >&2
+            return 1
+        fi
+    else
+        mkdir -p "$(dirname "$full_path")"
+
+        if [ -n "$content_file" ]; then
+            cat -- "$content_file" > "$full_path"
+        else
+            printf '%s\n' "$content" > "$full_path"
+        fi
+    fi
+
+    git -C "$MEM_DIR" add -- "$file"
+    if [ -n "$body" ]; then
+        git -C "$MEM_DIR" commit -q -m "$title" -m "$body"
+    else
+        git -C "$MEM_DIR" commit -q -m "$title"
+    fi
+
+    local hash
+    hash=$(git -C "$MEM_DIR" rev-parse HEAD)
+
+    if [ "$delete_content_file" -eq 1 ]; then
+        if ! rm -f -- "$content_file"; then
+            echo "Warning: write succeeded but failed to delete content file: $content_file" >&2
+        fi
+    fi
+
+    echo "OK: $hash|$file"
+}
+
+cmd_init() {
+    ensure_init
+
+    if plain_mode_enabled; then
+        echo "OK: Plain memory directory ready at $MEM_DIR"
+        return 0
+    fi
+
+    echo "OK: Memory repo initialized at $MEM_DIR"
+}
+
+cmd_search() {
+    ensure_init
+    require_git_backed_repo || return 1
+    local keywords="${1:-}"
+    shift || true
+    local skip='0'
+    local mode='auto'
+
+    if [ -z "$keywords" ]; then
+        echo 'Usage: mem.sh search <keywords_csv> [skip] [mode] [--mode <and|or|auto>]' >&2
+        return 1
+    fi
+
+    if [ $# -gt 0 ] && [[ "${1:-}" =~ ^-?[0-9]+$ ]]; then
+        skip="$1"
+        shift
+    fi
+
+    if [ $# -gt 0 ] && [ "${1:-}" != '--mode' ]; then
+        mode="$1"
+        shift
+    fi
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --mode)
+                if [ $# -lt 2 ]; then
+                    echo 'Error: --mode requires a value (and|or|auto)' >&2
+                    return 1
+                fi
+                mode="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown option for search: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    if ! [[ "$skip" =~ ^[0-9]+$ ]]; then
+        echo 'Error: skip must be a non-negative integer' >&2
+        return 1
+    fi
+
+    mode=$(echo "$mode" | tr '[:upper:]' '[:lower:]')
+    case "$mode" in
+        and|or|auto) ;;
+        *)
+            echo 'Error: mode must be one of: and, or, auto' >&2
+            return 1
+            ;;
+    esac
+
+    local grep_args=()
+    IFS=',' read -ra kw_array <<< "$keywords"
+    for kw in "${kw_array[@]}"; do
+        kw=$(echo "$kw" | xargs)
+        [ -n "$kw" ] && grep_args+=(--grep="$kw")
+    done
+
+    if [ ${#grep_args[@]} -eq 0 ]; then
+        echo 'Error: no valid keywords' >&2
+        return 1
+    fi
+
+    local active_entries
+    active_entries=$(git -C "$MEM_DIR" ls-tree -r --name-only HEAD -- entries/ 2>/dev/null || true)
+    local active_entries_nl=$'\n'"$active_entries"$'\n'
+
+    run_search_for_mode() {
+        local search_mode="$1"
+        local search_skip="$2"
+        local mode_args=()
+        [ "$search_mode" = 'and' ] && mode_args+=(--all-match)
+
+        local limit=20
+        local batch_size=200
+        local raw_skip=0
+        local remaining_skip="$search_skip"
+        local results=()
+        local reached_limit=0
+
+        while [ "${#results[@]}" -lt "$limit" ]; do
+            local batch_output
+            batch_output=$(git -C "$MEM_DIR" log "${grep_args[@]}" "${mode_args[@]}"                 -i --skip="$raw_skip" --max-count="$batch_size"                 --format=$'%H\t%s\t%cd' --date=iso                 --name-only --all -- entries/ 2>/dev/null || true)
+
+            [ -z "$batch_output" ] && break
+
+            local batch_count=0
+            local current_hash=""
+            local current_subject=""
+            local current_date=""
+            local current_file=""
+
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+
+                local parsed_hash parsed_subject parsed_date
+                IFS=$'\t' read -r parsed_hash parsed_subject parsed_date <<< "$line"
+
+                if [[ "$parsed_hash" =~ ^[0-9a-f]{40}$ ]]; then
+                    if [ -n "$current_hash" ]; then
+                        if [[ "$current_subject" != delete:\ remove* ]] && [ -n "$current_file" ] && [[ "$active_entries_nl" == *$'\n'"$current_file"$'\n'* ]]; then
+                            if [ "$remaining_skip" -gt 0 ]; then
+                                remaining_skip=$((remaining_skip - 1))
+                            else
+                                results+=("$current_hash|$current_subject|$current_date")
+                                if [ "${#results[@]}" -ge "$limit" ]; then
+                                    reached_limit=1
+                                    break
+                                fi
+                            fi
+                        fi
+                    fi
+
+                    current_hash="$parsed_hash"
+                    current_subject="$parsed_subject"
+                    current_date="$parsed_date"
+                    current_file=""
+                    batch_count=$((batch_count + 1))
+                    continue
+                fi
+
+                if [ -z "$current_file" ] && [[ "$line" == entries/*.md ]]; then
+                    current_file="$line"
+                fi
+            done <<< "$batch_output"
+
+            if [ "$reached_limit" -ne 1 ] && [ -n "$current_hash" ]; then
+                if [[ "$current_subject" != delete:\ remove* ]] && [ -n "$current_file" ] && [[ "$active_entries_nl" == *$'\n'"$current_file"$'\n'* ]]; then
+                    if [ "$remaining_skip" -gt 0 ]; then
+                        remaining_skip=$((remaining_skip - 1))
+                    else
+                        results+=("$current_hash|$current_subject|$current_date")
+                        if [ "${#results[@]}" -ge "$limit" ]; then
+                            reached_limit=1
+                        fi
+                    fi
+                fi
+            fi
+
+            [ "$reached_limit" -eq 1 ] && break
+            [ "$batch_count" -lt "$batch_size" ] && break
+            raw_skip=$((raw_skip + batch_size))
+        done
+
+        printf '%s\n' "${results[@]}"
+    }
+
+    if [ "$mode" = 'auto' ]; then
+        local auto_min_results=3
+        local and_results and_count
+        and_results="$(run_search_for_mode and "$skip")"
+        and_count=$(printf '%s\n' "$and_results" | awk 'NF { c++ } END { print c + 0 }')
+
+        if [ "$and_count" -ge "$auto_min_results" ]; then
+            printf '%s\n' "$and_results" | sed '/^$/d'
+        else
+            run_search_for_mode or "$skip"
+        fi
+        return 0
+    fi
+
+    run_search_for_mode "$mode" "$skip"
+}
+
+entry_file_from_commit() {
+    local commit_hash="$1"
+    [ -z "$commit_hash" ] && return 0
+
+    local file
+    file=$(git -C "$MEM_DIR" diff-tree --no-commit-id --name-only -r "$commit_hash" -- entries/ 2>/dev/null | head -1)
+
+    if [ -z "$file" ]; then
+        file=$(git -C "$MEM_DIR" diff-tree --root --no-commit-id --name-only -r "$commit_hash" -- entries/ 2>/dev/null | head -1)
+    fi
+
+    printf '%s\n' "$file"
+}
+
+cmd_read() {
+    ensure_init
+    require_git_backed_repo || return 1
+    local commit_hash="${1:-}"
+
+    if [ -z "$commit_hash" ]; then
+        echo 'Usage: mem.sh read <commit_hash>' >&2
+        return 1
+    fi
+
+    local file
+    file=$(entry_file_from_commit "$commit_hash")
+
+    if [ -n "$file" ]; then
+        git -C "$MEM_DIR" show "$commit_hash:$file" 2>/dev/null
+    else
+        echo "Error: no entry file found in commit $commit_hash" >&2
+        return 1
+    fi
+}
+
+cmd_delete() {
+    ensure_init
+    require_git_backed_repo || return 1
+    local commit_hash="${1:-}"
+
+    if [ -z "$commit_hash" ]; then
+        echo 'Usage: mem.sh delete <commit_hash>' >&2
+        return 1
+    fi
+
+    local file
+    file=$(entry_file_from_commit "$commit_hash")
+
+    if [ -z "$file" ]; then
+        echo "Error: no entry file found in commit $commit_hash" >&2
+        return 1
+    fi
+
+    if [ -f "$MEM_DIR/$file" ]; then
+        git -C "$MEM_DIR" rm -q -- "$file"
+        git -C "$MEM_DIR" commit -q -m "delete: remove $(basename "$file" .md)"
+        echo "OK: deleted $file"
+    else
+        echo "Error: file already deleted: $file" >&2
+        return 1
+    fi
+}
+
+case "${1:-help}" in
+    init)    shift; cmd_init "$@" ;;
+    search)  shift; cmd_search "$@" ;;
+    read)    shift; cmd_read "$@" ;;
+    write)   shift; cmd_write "$@" ;;
+    delete)  shift; cmd_delete "$@" ;;
+    *)
+        echo 'Usage: mem.sh {init|search|read|write|delete}' >&2
+        echo '  init                                    Initialize .mem repo' >&2
+        echo '  search <keywords_csv> [skip] [mode] [--mode M]  Search memories (M: and|or|auto)' >&2
+        echo '  read <commit_hash>                      Read memory content' >&2
+        echo '  write --title T [--file F] [--body B] [--content-file P | --content C]' >&2
+        echo '  delete <commit_hash>                    Delete memory entry' >&2
+        ;;
+esac
